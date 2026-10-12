@@ -22,6 +22,8 @@ import { projectScopeRequiresTrustMessage, resolveExecutionAgentScope } from "..
 import { handleManagementAction } from "../../agents/agent-management.ts";
 import { handleRefinementAction } from "../../agents/agent-refinements.ts";
 import { buildDoctorReport } from "../../extension/doctor.ts";
+import { readAgentCapacitySnapshot, formatAgentCapacity } from "../../shared/agent-capacity.ts";
+import { resolveAgentCapacity } from "../../shared/agent-capacity-settings.ts";
 import { readSubagentGuide } from "../../extension/subagent-guide.ts";
 import { isWorkflowScriptPath, normalizePublicSubagentExecution, validateWorkflowCapacityOverrides } from "../../extension/public-execution.ts";
 import { readReplyWorkflowScript } from "../../extension/reply-workflow-script.ts";
@@ -667,12 +669,19 @@ function withSpawnBudgetStatus(
 		})
 		: { used: 0, limit: resolveMaxActiveAsyncRunsPerSession(config.maxActiveAsyncRunsPerSession) ?? 0 };
 	state.activeAsyncCapacity = activeAsyncCapacity;
+	const agentCapacity = readAgentCapacitySnapshot(resolveAgentCapacity().limit);
+	// An uncapped pool has nothing worth reporting, so it stays out of the way.
+	const capacityLines = [
+		formatSpawnBudget(spawnBudget),
+		`Active async capacity: ${activeAsyncCapacity.used}/${activeAsyncCapacity.limit || "unlimited"} used`,
+		...(agentCapacity.limit === null ? [] : [formatAgentCapacity(agentCapacity)]),
+	].join("\n");
 	return {
 		...result,
 		content: result.content.map((item, index) => index === 0 && item.type === "text"
-			? { ...item, text: `${formatSpawnBudget(spawnBudget)}\nActive async capacity: ${activeAsyncCapacity.used}/${activeAsyncCapacity.limit || "unlimited"} used\n${item.text}` }
+			? { ...item, text: `${capacityLines}\n${item.text}` }
 			: item),
-		details: { ...result.details, spawnBudget, activeAsyncCapacity },
+		details: { ...result.details, spawnBudget, activeAsyncCapacity, agentCapacity },
 	};
 }
 
@@ -7043,6 +7052,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					? getActiveAsyncCapacitySnapshot(budgetSessionId, resolveMaxActiveAsyncRunsPerSession(deps.config.maxActiveAsyncRunsPerSession), { liveWorkflowRunIds: new Set(deps.state.workflowControllers?.keys() ?? []), abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) })
 					: { used: 0, limit: resolveMaxActiveAsyncRunsPerSession(deps.config.maxActiveAsyncRunsPerSession) ?? 0 };
 				deps.state.activeAsyncCapacity = activeAsyncCapacity;
+				const agentCapacity = readAgentCapacitySnapshot(resolveAgentCapacity().limit);
 				return {
 					content: [{
 						type: "text",
@@ -7056,6 +7066,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							currentSessionId,
 							spawnBudget,
 							activeAsyncCapacity,
+							agentCapacity,
 							orchestratorTarget,
 							sessionError,
 							expandTilde: deps.expandTilde,

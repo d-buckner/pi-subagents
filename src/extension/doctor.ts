@@ -16,6 +16,7 @@ import {
 	normalizeMaxSubagentSpawnsPerRun,
 	resolveMaxSubagentSpawnsPerRun,
 } from "../shared/types.ts";
+import type { AgentCapacitySnapshot } from "../shared/agent-capacity.ts";
 
 interface DoctorPaths {
 	tempRootDir: string;
@@ -41,6 +42,7 @@ interface DoctorReportInput {
 	currentSessionId?: string | null;
 	spawnBudget: SpawnBudgetSnapshot;
 	activeAsyncCapacity: ActiveAsyncCapacitySnapshot;
+	agentCapacity?: AgentCapacitySnapshot;
 	orchestratorTarget?: string;
 	sessionError?: string;
 	expandTilde?: (value: string) => string;
@@ -196,6 +198,17 @@ function formatActiveAsyncCapacitySection(input: DoctorReportInput): string[] {
 	];
 }
 
+function formatAgentCapacitySection(input: DoctorReportInput): string[] {
+	const snapshot = input.agentCapacity;
+	if (!snapshot) return ["- capacity: not measured by this runtime"];
+	return [
+		`- usage: ${snapshot.used}/${snapshot.limit ?? "unlimited"} model-active agents, ${snapshot.remaining ?? "unlimited"} free`,
+		`- waiting: ${snapshot.waiting} agent(s) inside a turn but blocked on a tool call or a reply, so they hold no slot`,
+		"- scope: every pi process of this user, parent sessions included; parent sessions are never blocked by the cap",
+		"- release: a turn settling, or a tool call outliving the model-idle grace; a dead process ages out without cleanup",
+	];
+}
+
 function formatPermissionSystemSection(): string[] {
 	const lines: string[] = [];
 	const parentSession = process.env["PI_SUBAGENT_PARENT_SESSION"] ?? "";
@@ -254,6 +267,9 @@ export function buildDoctorReport(input: DoctorReportInput): string {
 		"",
 		"Active async capacity",
 		...formatActiveAsyncCapacitySection(input),
+		"",
+		"Agent capacity",
+		...formatAgentCapacitySection(input),
 		"",
 		"Workflow script",
 		...formatWorkflowScriptSection(),

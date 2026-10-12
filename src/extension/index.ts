@@ -53,6 +53,11 @@ import { createNativeSupervisorChannel } from "../intercom/native-supervisor-cha
 import { renderSubagentEntry, renderSubagentMessage, SUBAGENT_ENTRY_TYPES, SUBAGENT_MESSAGE_TYPES } from "../tui/subagent-messages.ts";
 import { registerHerdrStatusBridge, type HerdrStatusRun } from "../integrations/herdr-status.ts";
 import { registerProgramStatusReporter } from "../integrations/program-status.ts";
+import {
+	createAgentActivityLease,
+	type AgentActivityLease,
+} from "../shared/agent-capacity.ts";
+import { resolveAgentCapacity } from "../shared/agent-capacity-settings.ts";
 import { hasLiveSubagentWork, registerPiWebSessionLiveness } from "../integrations/pi-web-session-liveness.ts";
 import { createRetainedNestedRouteTracker } from "../runs/background/retained-nested-route-tracker.ts";
 import { listHerdrProjectPaneRoots, restoreHerdrProjectPaneSnapshots } from "../inspectors/herdr/project-panes.ts";
@@ -469,6 +474,42 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		getJobs: () => new Map([...(state.fleetJobs ?? []), ...state.asyncJobs]).values(),
 		getPendingRequests: () => supervisorChannel.pending.values(),
 	});
+	// Machine-wide agent capacity. This parent session is never gated by it —
+	// opening a pi session is the operator's own act — but it occupies a slot
+	// while it works the model, so children can see the room it takes.
+	const agentCapacity = resolveAgentCapacity();
+	let parentActivityLease: AgentActivityLease | undefined;
+	const parentActivity = {
+		start(sessionId: string | null) {
+			parentActivityLease?.release();
+			parentActivityLease = undefined;
+			// Without a configured cap there is nothing to count, so nothing is written.
+			if (agentCapacity.limit === null) return;
+			parentActivityLease = createAgentActivityLease({
+				kind: "parent",
+				label: "pi session",
+				limit: null,
+				idleAfterMs: agentCapacity.idleAfterMs,
+				...(sessionId ? { sessionId } : {}),
+			});
+		},
+		markRunning() {
+			parentActivityLease?.markRunning();
+		},
+		markIdle() {
+			parentActivityLease?.markIdle();
+		},
+		toolStarted(toolCallId: string) {
+			parentActivityLease?.toolStarted(toolCallId);
+		},
+		toolEnded(toolCallId: string) {
+			parentActivityLease?.toolEnded(toolCallId);
+		},
+		dispose() {
+			parentActivityLease?.release();
+			parentActivityLease = undefined;
+		},
+	};
 	const { ensurePoller, refreshWidget, handleStarted, handleComplete, resetJobs, restoreActiveJobs, dispose: disposeAsyncJobTracker } = createAsyncJobTracker(pi, state, DIRS.async, {
 		widgetEnabled: asyncWidgetEnabled,
 		widgetCollapsed: asyncWidgetCollapsed,
@@ -951,6 +992,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			if (runtimeCleaned) return;
 			runtimeCleaned = true;
 			programStatus.dispose(shutdownReason);
+			parentActivity.dispose();
 			releaseHostSessionLiveness();
 			releaseHostSessionLiveness = () => {};
 			// Detached foreground children run in this runtime's memory, and the next runtime
@@ -1058,6 +1100,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	pi.on("agent_start", () => {
 		cancelCompactionResume();
 		parentWake.agentStarted();
+		parentActivity.markRunning();
 		resumeWidgetsAfterCompaction();
 		herdrStatusBridge.agentStarted();
 		programStatus.agentStarted();
@@ -1066,9 +1109,16 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	pi.on("message_start", (event) => completionNotifier.messageStarted(event.message));
 
 	pi.on("agent_settled", () => {
+		// Settled means no retry, compaction, or queued continuation is left, so the
+		// session is off the model and gives its slot back.
+		parentActivity.markIdle();
 		resumeWidgetsAfterCompaction();
 		programStatus.agentSettled();
 	});
+
+	pi.on("tool_execution_start", (event) => parentActivity.toolStarted(event.toolCallId));
+
+	pi.on("tool_execution_end", (event) => parentActivity.toolEnded(event.toolCallId));
 
 	pi.on("session_before_compact", (event) => {
 		if (event.reason !== "manual") suspendWidgetsForCompaction();
@@ -1124,6 +1174,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			})
 			: { registered: false, release: () => {} };
 		releaseHostSessionLiveness = liveness.release;
+		parentActivity.start(sessionId);
 		if (liveness.registered) {
 			retainedNestedRouteTracker = createRetainedNestedRouteTracker(state);
 			executorDeps.trackRetainedNestedRoute = retainedNestedRouteTracker.track;

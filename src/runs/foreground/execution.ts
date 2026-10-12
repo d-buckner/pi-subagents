@@ -7,6 +7,12 @@ import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import { discoverAgents, formatUnknownAgentError, unknownAgentDiagnosticContext, type AgentConfig } from "../../agents/agents.ts";
 import { alignForkedSessionCwd } from "../../shared/fork-session-cwd.ts";
+import {
+	acquireAgentCapacitySlot,
+	driveAgentActivityLease,
+	type AgentActivityLease,
+} from "../../shared/agent-capacity.ts";
+import { resolveAgentCapacity } from "../../shared/agent-capacity-settings.ts";
 import { buildEffectiveSystemPrompt } from "../shared/effective-system-prompt.ts";
 import {
 	ensureArtifactsDir,
@@ -573,6 +579,8 @@ async function runSingleAttempt(
 		let session: ChildSession | undefined;
 		let messageBaseline: number | undefined;
 		let unsubscribe: (() => void) | undefined;
+		// Machine-wide capacity held for this child while it works the model.
+		let activityLease: AgentActivityLease | undefined;
 		let sessionSettled = false;
 		let lifecycleFinished = false;
 		let detached = false;
@@ -770,6 +778,8 @@ async function runSingleAttempt(
 			removeAbortListener?.();
 			removeInterruptListener?.();
 			unsubscribe?.();
+			activityLease?.release();
+			activityLease = undefined;
 			onWatchdogStatus = undefined;
 			void jsonlWriter.close().catch(() => {
 				// JSONL artifact flush is best effort.
@@ -977,6 +987,7 @@ async function runSingleAttempt(
 
 		const processEvent = (evt: ChildSessionEvent & { message?: Message; toolName?: string; toolCallId?: string; args?: unknown; willRetry?: unknown }) => {
 			if (lifecycleFinished) return;
+			if (activityLease) driveAgentActivityLease(activityLease, evt as { type?: string; toolCallId?: string });
 			partialOutput.observe(evt);
 			jsonlWriter.writeLine(JSON.stringify(projectChildSessionEventForJson(evt)));
 			shared.transcriptWriter?.writeChildEvent(evt);
@@ -1416,6 +1427,26 @@ async function runSingleAttempt(
 		void (async () => {
 			try {
 				const input = createReportedChildSessionInput(launch, shared.transcriptWriter);
+				const capacity = resolveAgentCapacity();
+				if (capacity.limit !== null) {
+					// Wait for room in the machine-wide pool before the child exists, so a
+					// queued launch never shows up as a running agent.
+					activityLease = await acquireAgentCapacitySlot({
+						limit: capacity.limit,
+						label: agent.name,
+						idleAfterMs: capacity.idleAfterMs,
+						queueTimeoutMs: capacity.queueTimeoutMs,
+						...(options.runId ? { runId: options.runId } : {}),
+						...(options.parentSessionId ? { sessionId: options.parentSessionId } : {}),
+						signal: options.signal,
+					});
+				}
+				if (lifecycleFinished) {
+					// The run ended while this launch waited; give the slot straight back.
+					activityLease?.release();
+					activityLease = undefined;
+					return;
+				}
 				const created = await childSessions.create(input);
 				if (lifecycleFinished) {
 					void created.dispose();
