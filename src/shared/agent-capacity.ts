@@ -2,6 +2,11 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+	DEFAULT_AGENT_MODEL_IDLE_AFTER_MS,
+	resolveAgentCapacity,
+	type ResolvedAgentCapacity,
+} from "./agent-capacity-settings.ts";
 import { TEMP_ROOT_DIR } from "./types.ts";
 
 /**
@@ -21,6 +26,11 @@ import { TEMP_ROOT_DIR } from "./types.ts";
  * Reclaim is opportunistic: an agent that finds the pool full when its tool
  * finally returns still finishes its turn, because admission already happened
  * and un-starting live model work is not something this pool can honestly undo.
+ *
+ * Everything here is fail-open. The pool exists to keep a machine from
+ * over-subscribing itself, so a lease that cannot be read, a lock that cannot be
+ * taken, or a directory that cannot be written must never cost a user a launch:
+ * each degrades to ungated instead of blocking.
  */
 
 export const AGENT_CAPACITY_DIR = path.join(TEMP_ROOT_DIR, "agent-capacity");
@@ -29,18 +39,12 @@ export const AGENT_CAPACITY_DIR = path.join(TEMP_ROOT_DIR, "agent-capacity");
 export const AGENT_CAPACITY_HEARTBEAT_MS = 5_000;
 /** A lease this old is dead: its owner stopped refreshing or died. */
 export const AGENT_CAPACITY_LEASE_TTL_MS = 3 * AGENT_CAPACITY_HEARTBEAT_MS;
-/** How long a tool call may run before its agent counts as waiting, not working. */
-export const DEFAULT_AGENT_MODEL_IDLE_AFTER_MS = 30_000;
-export const MIN_AGENT_MODEL_IDLE_AFTER_MS = 5_000;
-export const MAX_AGENT_MODEL_IDLE_AFTER_MS = 10 * 60_000;
-/** How long a child waits for capacity before its launch fails. */
-export const DEFAULT_AGENT_CAPACITY_QUEUE_TIMEOUT_MS = 30 * 60_000;
-export const MIN_AGENT_CAPACITY_QUEUE_TIMEOUT_MS = 1_000;
-export const MAX_AGENT_CAPACITY_QUEUE_TIMEOUT_MS = 24 * 60 * 60_000;
 /** Poll interval while a child waits for a slot. */
 export const AGENT_CAPACITY_POLL_MS = 1_000;
 
 const ADMISSION_LOCK_STALE_MS = 5_000;
+const ADMISSION_LOCK_ATTEMPTS = 40;
+const ADMISSION_LOCK_RETRY_MS = 50;
 /** Past this age a dead owner's lease is removed instead of merely ignored. */
 const LEASE_GC_AFTER_MS = 60 * 60_000;
 
@@ -66,9 +70,20 @@ export interface AgentCapacitySnapshot {
 	limit: number | null;
 	used: number;
 	remaining: number | null;
-	/** Live agents inside a turn but waiting on a tool or a reply instead of the model. */
+	/** Live agents inside a turn but waiting on a long tool call instead of the model. */
 	waiting: number;
 	occupants: AgentCapacityOccupant[];
+	/** The pool could not be read, so the counts above are not trustworthy. */
+	unreadable?: boolean;
+}
+
+/**
+ * A pi agent or child-session event, narrowed to what a lease reads. Hosts may
+ * forward their whole event stream; anything unrecognised is ignored.
+ */
+export interface AgentCapacityEvent {
+	type?: string;
+	toolCallId?: string;
 }
 
 export class AgentCapacityUnavailableError extends Error {
@@ -79,25 +94,6 @@ export class AgentCapacityUnavailableError extends Error {
 		this.name = "AgentCapacityUnavailableError";
 		this.snapshot = snapshot;
 	}
-}
-
-/** `undefined` means unlimited. Mirrors `resolveMaxActiveAsyncRunsPerSession`. */
-export function resolveMaxActiveAgents(value: unknown): number | undefined {
-	if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) return undefined;
-	return value;
-}
-
-function resolveBoundedMs(value: unknown, fallback: number, min: number, max: number): number {
-	if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) return fallback;
-	return value;
-}
-
-export function resolveAgentModelIdleAfterMs(value: unknown): number {
-	return resolveBoundedMs(value, DEFAULT_AGENT_MODEL_IDLE_AFTER_MS, MIN_AGENT_MODEL_IDLE_AFTER_MS, MAX_AGENT_MODEL_IDLE_AFTER_MS);
-}
-
-export function resolveAgentCapacityQueueTimeoutMs(value: unknown): number {
-	return resolveBoundedMs(value, DEFAULT_AGENT_CAPACITY_QUEUE_TIMEOUT_MS, MIN_AGENT_CAPACITY_QUEUE_TIMEOUT_MS, MAX_AGENT_CAPACITY_QUEUE_TIMEOUT_MS);
 }
 
 function processIsAlive(pid: number): boolean {
@@ -136,7 +132,6 @@ function ensureCapacityRoot(rootDir: string): void {
 }
 
 function writeOccupant(rootDir: string, occupant: AgentCapacityOccupant): void {
-	ensureCapacityRoot(rootDir);
 	const target = leasePath(rootDir, occupant.key);
 	const temp = `${target}.${randomUUID()}.tmp`;
 	fs.writeFileSync(temp, `${JSON.stringify(occupant)}\n`, { encoding: "utf-8", mode: 0o600 });
@@ -191,8 +186,26 @@ export function readAgentCapacityOccupants(rootDir = AGENT_CAPACITY_DIR, now = D
 	return occupants.sort((left, right) => left.claimedAt - right.claimedAt || left.key.localeCompare(right.key));
 }
 
-export function readAgentCapacitySnapshot(limit: number | null | undefined, rootDir = AGENT_CAPACITY_DIR, now = Date.now()): AgentCapacitySnapshot {
-	const occupants = readAgentCapacityOccupants(rootDir, now);
+/**
+ * Live occupants, or `undefined` when the pool could not be read at all.
+ *
+ * Every gate in this module treats `undefined` as unlimited rather than as full,
+ * because a transient `EACCES` or `EMFILE` must not stall or fail a launch.
+ */
+function tryReadOccupants(rootDir: string, now: () => number): AgentCapacityOccupant[] | undefined {
+	try {
+		return readAgentCapacityOccupants(rootDir, now());
+	} catch {
+		return undefined;
+	}
+}
+
+export function readAgentCapacitySnapshot(
+	limit: number | null | undefined,
+	options: { rootDir?: string; now?: () => number } = {},
+): AgentCapacitySnapshot {
+	const occupants = tryReadOccupants(options.rootDir ?? AGENT_CAPACITY_DIR, options.now ?? Date.now);
+	if (!occupants) return { limit: limit ?? null, used: 0, remaining: limit == null ? null : limit, waiting: 0, occupants: [], unreadable: true };
 	const used = occupants.filter((occupant) => occupant.active).length;
 	return {
 		limit: limit ?? null,
@@ -204,8 +217,9 @@ export function readAgentCapacitySnapshot(limit: number | null | undefined, root
 }
 
 export function formatAgentCapacity(snapshot: AgentCapacitySnapshot): string {
+	if (snapshot.unreadable) return "Agent capacity: unavailable (the pool could not be read, so launches stay ungated)";
 	if (snapshot.limit === null) return `Agent capacity: unlimited (${snapshot.used} model-active, ${snapshot.waiting} waiting)`;
-	return `Agent capacity: ${snapshot.used}/${snapshot.limit} in use, ${snapshot.remaining} free (${snapshot.waiting} waiting on a tool or a reply)`;
+	return `Agent capacity: ${snapshot.used}/${snapshot.limit} in use, ${snapshot.remaining} free (${snapshot.waiting} waiting on a long tool call)`;
 }
 
 interface AdmissionLockOwner {
@@ -221,16 +235,23 @@ function readAdmissionLockOwner(lockPath: string): AdmissionLockOwner | undefine
 	return undefined;
 }
 
+/** Returned instead of throwing when the lock could not be taken; callers proceed ungated. */
+const LOCK_UNAVAILABLE = Symbol("agent capacity admission lock unavailable");
+
 /**
  * Serializes the check-then-claim so two launches that both see one free slot
- * cannot both take it. Held for one directory read and one file rename, never
- * across a run.
+ * cannot both take it.
+ *
+ * `operation` runs while the lock is held and must stay quick — a directory read
+ * and a file rename, never a run. Contention is never fatal: a wedged lock is
+ * reclaimed, and a lock that still cannot be taken returns `LOCK_UNAVAILABLE` so
+ * the caller can claim unsafely, because losing a rare race on the last slot
+ * costs less than failing a user's launch.
  */
-function withAdmissionLock<T>(rootDir: string, operation: () => T): T {
-	ensureCapacityRoot(rootDir);
+async function withAdmissionLock<T>(rootDir: string, operation: () => T): Promise<T | typeof LOCK_UNAVAILABLE> {
 	const lockPath = path.join(rootDir, "admission.lock");
 	const owner: AdmissionLockOwner = { pid: process.pid, token: randomUUID() };
-	for (let attempt = 0; attempt < 200; attempt++) {
+	for (let attempt = 0; attempt < ADMISSION_LOCK_ATTEMPTS; attempt++) {
 		let acquired = false;
 		try {
 			fs.mkdirSync(lockPath, { mode: 0o700 });
@@ -241,35 +262,37 @@ function withAdmissionLock<T>(rootDir: string, operation: () => T): T {
 				throw error;
 			}
 			acquired = true;
-			return operation();
+			try {
+				return operation();
+			} finally {
+				if (readAdmissionLockOwner(lockPath)?.token === owner.token) fs.rmSync(lockPath, { recursive: true, force: true });
+			}
 		} catch (error) {
 			if (acquired) throw error;
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") return LOCK_UNAVAILABLE;
 			const held = readAdmissionLockOwner(lockPath);
 			const wedged = held ? !processIsAlive(held.pid) : Date.now() - fs.statSync(lockPath).mtimeMs > ADMISSION_LOCK_STALE_MS;
 			if (wedged) {
-				const tombstone = path.join(rootDir, `admission.stale-${randomUUID()}`);
 				try {
-					fs.renameSync(lockPath, tombstone);
-					fs.rmSync(tombstone, { recursive: true, force: true });
-					continue;
+					fs.renameSync(lockPath, path.join(rootDir, `admission.stale-${randomUUID()}`));
+					fs.rmSync(path.join(rootDir, `admission.stale-${randomUUID()}`), { recursive: true, force: true });
 				} catch (reclaimError) {
-					if ((reclaimError as NodeJS.ErrnoException).code !== "ENOENT") throw reclaimError;
+					if ((reclaimError as NodeJS.ErrnoException).code !== "ENOENT") return LOCK_UNAVAILABLE;
 				}
+				continue;
 			}
-			const until = Date.now() + Math.min(50, 2 * 2 ** Math.min(attempt, 4));
-			while (Date.now() < until) { /* brief hand-over wait; the lock is never held across a run */ }
-		} finally {
-			if (acquired && readAdmissionLockOwner(lockPath)?.token === owner.token) fs.rmSync(lockPath, { recursive: true, force: true });
+			await new Promise<void>((resolve) => {
+				setTimeout(resolve, ADMISSION_LOCK_RETRY_MS).unref?.();
+			});
 		}
 	}
-	throw new Error(`Timed out acquiring the agent capacity admission lock at '${rootDir}'.`);
+	return LOCK_UNAVAILABLE;
 }
 
 export interface AgentActivityLeaseInput {
 	kind: AgentCapacityKind;
 	label: string;
-	/** Pool the lease competes in. `undefined` or `null` means unlimited, so the owner always claims a slot. */
+	/** Pool the lease competes in. `null` means unlimited, so the owner always claims a slot. */
 	limit?: number | null;
 	runId?: string;
 	sessionId?: string;
@@ -279,22 +302,26 @@ export interface AgentActivityLeaseInput {
 	now?: () => number;
 }
 
+/**
+ * One agent's claim on the pool, driven by that agent's own events.
+ *
+ * The contract callers need: a lease may stop holding capacity at any moment —
+ * the pool filled, the tool ran long, another process died — and nothing a
+ * caller does may depend on the slot still being there. `release()` is terminal
+ * and idempotent; a released lease records nothing further.
+ */
 export interface AgentActivityLease {
-	readonly key: string;
-	/** True while this lease is counted against the pool. */
-	isHolding(): boolean;
-	/** The agent is doing model work. Claims capacity when a slot is available. */
-	markRunning(): void;
-	/** Inside a turn but not on the model: capacity is released, the lease stays visible. */
-	markWaiting(): void;
-	/** The turn is over. Capacity is released and the lease is removed. */
-	markIdle(): void;
-	toolStarted(toolCallId: string): void;
-	toolEnded(toolCallId: string): void;
-	/** Drops the lease entirely. Idempotent. */
+	/** Feed one agent or tool event. Never throws; unknown events are ignored. */
+	drive(event: AgentCapacityEvent): void;
+	/** Terminal: stop counting, stop refreshing, remove the lease. Idempotent. */
 	release(): void;
-	snapshot(): AgentCapacityOccupant | undefined;
 }
+
+/** Returned instead of a real lease when no cap is configured, so callers need no guard. */
+const UNLIMITED_LEASE: AgentActivityLease = Object.freeze({
+	drive() {},
+	release() {},
+});
 
 /**
  * Keeps one lease in step with one agent's loop. Feed it the agent's lifecycle
@@ -304,7 +331,7 @@ export function createAgentActivityLease(input: AgentActivityLeaseInput): AgentA
 	const rootDir = input.rootDir ?? AGENT_CAPACITY_DIR;
 	const heartbeatMs = input.heartbeatMs ?? AGENT_CAPACITY_HEARTBEAT_MS;
 	const idleAfterMs = input.idleAfterMs ?? DEFAULT_AGENT_MODEL_IDLE_AFTER_MS;
-	const limit = resolveMaxActiveAgents(input.limit ?? undefined) ?? null;
+	const limit = input.limit ?? null;
 	const now = input.now ?? Date.now;
 	const key = `${input.kind}-${process.pid}-${randomUUID().slice(0, 8)}`;
 	const base = {
@@ -322,9 +349,8 @@ export function createAgentActivityLease(input: AgentActivityLeaseInput): AgentA
 	let exists = false;
 	let active = false;
 	let running = false;
-	/** Set while the agent is knowingly off the model; blocks auto-reclaim. */
-	let heldBack = false;
 	let released = false;
+	/** Open tool calls by id, mapped to when each began. */
 	const openTools = new Map<string, number>();
 	let heartbeat: ReturnType<typeof setInterval> | undefined;
 	let blockTimer: ReturnType<typeof setTimeout> | undefined;
@@ -335,7 +361,15 @@ export function createAgentActivityLease(input: AgentActivityLeaseInput): AgentA
 			writeOccupant(rootDir, { ...base, active, lastSeenAt: now() });
 			exists = true;
 		} catch {
-			// A lease that cannot be written must not break the agent it describes.
+			// A missing directory is the only recoverable cause, and the only reason
+			// to pay for a mkdir: the happy path writes straight through.
+			try {
+				ensureCapacityRoot(rootDir);
+				writeOccupant(rootDir, { ...base, active, lastSeenAt: now() });
+				exists = true;
+			} catch {
+				// A lease that cannot be written must not break the agent it describes.
+			}
 		}
 	};
 
@@ -357,11 +391,9 @@ export function createAgentActivityLease(input: AgentActivityLeaseInput): AgentA
 
 	const roomAvailable = (): boolean => {
 		if (limit === null) return true;
-		try {
-			return readAgentCapacityOccupants(rootDir, now()).filter((occupant) => occupant.active).length < limit;
-		} catch {
-			return false;
-		}
+		const occupants = tryReadOccupants(rootDir, now);
+		if (!occupants) return true;
+		return occupants.filter((occupant) => occupant.active).length < limit;
 	};
 
 	const stopTimers = (): void => {
@@ -374,20 +406,14 @@ export function createAgentActivityLease(input: AgentActivityLeaseInput): AgentA
 	/** One pass of the state machine: hold capacity only while the agent works the model. */
 	const evaluate = (): void => {
 		if (released || !running) return;
-		if (blockedOnTool() || heldBack) {
-			if (active) active = false;
+		if (blockedOnTool()) {
+			active = false;
 			persist();
 			return;
 		}
-		if (!active) {
-			// Returning from a long tool call reclaims capacity only when room is
-			// free; live model work is never stopped for want of a slot.
-			if (!roomAvailable()) {
-				persist();
-				return;
-			}
-			active = true;
-		}
+		// Returning from a long tool call reclaims capacity only when room is free;
+		// live model work is never stopped for want of a slot.
+		active = active || roomAvailable();
 		persist();
 	};
 
@@ -411,36 +437,34 @@ export function createAgentActivityLease(input: AgentActivityLeaseInput): AgentA
 	heartbeat.unref?.();
 
 	return {
-		key,
-		isHolding: () => active,
-		markRunning() {
-			running = true;
-			heldBack = false;
-			evaluate();
-		},
-		markWaiting() {
-			heldBack = true;
-			if (active || !exists) {
-				active = false;
-				persist();
+		drive(event) {
+			if (released) return;
+			switch (event.type) {
+				case "agent_start":
+				case "auto_retry_start":
+					running = true;
+					evaluate();
+					return;
+				case "agent_end":
+				case "agent_settled":
+					// Off the model until the next turn: stop counting, stay invisible.
+					running = false;
+					active = false;
+					openTools.clear();
+					drop();
+					return;
+				case "tool_execution_start":
+					openTools.set(event.toolCallId ?? event.type!, now());
+					armBlockTimer();
+					return;
+				case "tool_execution_end":
+					openTools.delete(event.toolCallId ?? event.type!);
+					evaluate();
+					armBlockTimer();
+					return;
+				default:
+					return;
 			}
-		},
-		markIdle() {
-			running = false;
-			heldBack = false;
-			active = false;
-			openTools.clear();
-			drop();
-		},
-		toolStarted(toolCallId) {
-			openTools.set(toolCallId, now());
-			armBlockTimer();
-		},
-		toolEnded(toolCallId) {
-			openTools.delete(toolCallId);
-			heldBack = false;
-			evaluate();
-			armBlockTimer();
 		},
 		release() {
 			if (released) return;
@@ -452,83 +476,86 @@ export function createAgentActivityLease(input: AgentActivityLeaseInput): AgentA
 			process.off("exit", onExit);
 			drop();
 		},
-		snapshot() {
-			return exists ? { ...base, active, lastSeenAt: now() } : undefined;
-		},
 	};
 }
 
 /**
- * Drives a lease from a pi agent or child-session event. Unknown events are
- * ignored, so a host can forward its whole event stream.
+ * The lease for a parent pi session.
+ *
+ * A parent competes against no limit — it is never gated — but it still holds a
+ * slot while it works the model, so children can see the room a busy parent
+ * takes. With no cap configured it is inert and nothing is written.
  */
-export function driveAgentActivityLease(lease: AgentActivityLease, event: { type?: string; toolCallId?: string }): void {
-	switch (event.type) {
-		case "agent_start":
-		case "auto_retry_start":
-			lease.markRunning();
-			return;
-		case "agent_end":
-		case "agent_settled":
-			lease.markWaiting();
-			return;
-		case "tool_execution_start":
-			lease.toolStarted(event.toolCallId ?? event.type);
-			return;
-		case "tool_execution_end":
-			lease.toolEnded(event.toolCallId ?? event.type);
-			return;
-		default:
-			return;
-	}
+export function createParentActivityLease(input: { label: string; sessionId?: string }): AgentActivityLease {
+	const settings = resolveAgentCapacity();
+	if (settings.limit === null) return UNLIMITED_LEASE;
+	return createAgentActivityLease({
+		kind: "parent",
+		label: input.label,
+		limit: null,
+		idleAfterMs: settings.idleAfterMs,
+		...(input.sessionId ? { sessionId: input.sessionId } : {}),
+	});
 }
 
 export interface AcquireAgentCapacityInput {
-	limit: number;
 	label: string;
 	runId?: string;
 	sessionId?: string;
-	idleAfterMs?: number;
-	queueTimeoutMs?: number;
-	rootDir?: string;
 	signal?: AbortSignal;
 	/** Called on each poll while the launch waits, so the caller can report why it is idle. */
 	onWait?: (snapshot: AgentCapacitySnapshot, waitedMs: number) => void;
+	/**
+	 * Pool to compete in, resolved from the config file when omitted. Passing it
+	 * pins the pool for a test; production callers never do.
+	 */
+	settings?: ResolvedAgentCapacity;
+	/** Test seams: the queue poll interval and the pool directory. */
 	pollMs?: number;
+	rootDir?: string;
 }
 
 /**
  * Takes one slot for a child that is about to start, waiting while the pool is
  * full. Throws `AgentCapacityUnavailableError` once the queue deadline passes
  * and rejects on abort, so a cancelled parent never leaves a queued child.
+ *
+ * With no cap configured this returns an inert lease without touching the
+ * filesystem, so an uncapped machine pays nothing and callers need no guard.
  */
 export async function acquireAgentCapacitySlot(input: AcquireAgentCapacityInput): Promise<AgentActivityLease> {
+	const settings = input.settings ?? resolveAgentCapacity();
+	if (settings.limit === null) return UNLIMITED_LEASE;
+	const limit = settings.limit;
 	const rootDir = input.rootDir ?? AGENT_CAPACITY_DIR;
 	const pollMs = input.pollMs ?? AGENT_CAPACITY_POLL_MS;
-	const queueTimeoutMs = input.queueTimeoutMs ?? DEFAULT_AGENT_CAPACITY_QUEUE_TIMEOUT_MS;
 	const startedAt = Date.now();
+	const claim = (): AgentActivityLease | undefined => {
+		const occupants = tryReadOccupants(rootDir, Date.now);
+		if (occupants && occupants.filter((occupant) => occupant.active).length >= limit) return undefined;
+		const lease = createAgentActivityLease({
+			kind: "child",
+			label: input.label,
+			limit,
+			runId: input.runId,
+			sessionId: input.sessionId,
+			idleAfterMs: settings.idleAfterMs,
+			rootDir,
+		});
+		// Claimed inside the lock so the count above stays true for the winner.
+		lease.drive({ type: "agent_start" });
+		return lease;
+	};
 	for (;;) {
 		if (input.signal?.aborted) throw new Error("Subagent launch was cancelled while it waited for agent capacity.");
-		const lease = withAdmissionLock(rootDir, () => {
-			const used = readAgentCapacityOccupants(rootDir).filter((occupant) => occupant.active).length;
-			if (used >= input.limit) return undefined;
-			const lease = createAgentActivityLease({
-				kind: "child",
-				label: input.label,
-				limit: input.limit,
-				runId: input.runId,
-				sessionId: input.sessionId,
-				idleAfterMs: input.idleAfterMs,
-				rootDir,
-			});
-			// Claimed inside the lock so the count above stays true for the winner.
-			lease.markRunning();
-			return lease;
-		});
+		const outcome = await withAdmissionLock(rootDir, claim);
+		const lease = outcome === LOCK_UNAVAILABLE ? claim() : outcome;
 		if (lease) return lease;
 		const waitedMs = Date.now() - startedAt;
-		if (waitedMs >= queueTimeoutMs) throw new AgentCapacityUnavailableError(readAgentCapacitySnapshot(input.limit, rootDir), waitedMs);
-		input.onWait?.(readAgentCapacitySnapshot(input.limit, rootDir), waitedMs);
+		if (waitedMs >= settings.queueTimeoutMs) {
+			throw new AgentCapacityUnavailableError(readAgentCapacitySnapshot(limit, { rootDir }), waitedMs);
+		}
+		input.onWait?.(readAgentCapacitySnapshot(limit, { rootDir }), waitedMs);
 		await new Promise<void>((resolve) => {
 			// Not unref'd on purpose: a launch that is waiting for capacity must keep
 			// its host alive instead of exiting under it.

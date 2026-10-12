@@ -33,10 +33,9 @@ import type { SteerDeliveryStatus, SteerRequest } from "./control-channel.ts";
 import { takeMatchingAcceptedSteer, unconsumedSteerReason } from "./steering.ts";
 import {
 	acquireAgentCapacitySlot,
-	driveAgentActivityLease,
 	type AgentActivityLease,
+	type AgentCapacityEvent,
 } from "../../shared/agent-capacity.ts";
-import { resolveAgentCapacity } from "../../shared/agent-capacity-settings.ts";
 
 export interface ChildEventContext {
 	runId: string;
@@ -424,7 +423,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 
 		const processEvent = (raw: ChildSessionEvent): void => {
 			if (settled) return;
-			if (activityLease) driveAgentActivityLease(activityLease, raw as { type?: string; toolCallId?: string });
+			if (activityLease) activityLease.drive(raw as AgentCapacityEvent);
 			partialOutput.observe(raw);
 			const event = raw as ChildSessionEvent & ChildEvent;
 			appendChildEvent(projectChildSessionEventForJson(raw) as Record<string, unknown>);
@@ -683,18 +682,13 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		void (async () => {
 			try {
 				const createInput = createReportedChildSessionInput(input.launch, input.transcriptWriter);
-				const capacity = resolveAgentCapacity();
-				if (capacity.limit !== null) {
-					// Wait for room in the machine-wide pool before the child exists, so a
-					// queued launch never shows up as a running agent.
-					activityLease = await acquireAgentCapacitySlot({
-						limit: capacity.limit,
-						label: input.childEventContext?.agent ?? "subagent",
-						idleAfterMs: capacity.idleAfterMs,
-						queueTimeoutMs: capacity.queueTimeoutMs,
-						...(input.childEventContext ? { runId: input.childEventContext.runId } : {}),
-					});
-				}
+				// Wait for room in the machine-wide pool before the child exists, so a
+				// queued launch never shows up as a running agent. With no cap configured
+				// this returns an inert lease without touching the filesystem.
+				activityLease = await acquireAgentCapacitySlot({
+					label: input.childEventContext?.agent ?? "subagent",
+					...(input.childEventContext ? { runId: input.childEventContext.runId } : {}),
+				});
 				if (settled) {
 					// The run ended while this launch waited; give the slot straight back.
 					activityLease?.release();

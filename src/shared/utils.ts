@@ -7,8 +7,11 @@ import { formatToolCall } from "./formatters.ts";
 import type { AgentProgress, AsyncStatus, Details, DisplayItem, ErrorInfo, NestedRunSummary, SingleResult, ToolCallSummary, Usage } from "./types.ts";
 import { validateAsyncStatusLaneMetadata } from "../runs/shared/lane-metadata.ts";
 
-// User-level path resolution lives in its own leaf module so a caller can find
-// the config directory without importing everything else in here.
+// User-level path resolution lives in `agent-dir.ts` so a caller can find the
+// config directory without importing everything else in here. `utils.ts` stays
+// the facade most modules should import from; import the leaf directly only when
+// the extra weight of this module is the problem — that is how
+// `agent-capacity-settings.ts` reaches it without pulling in pi-ai types.
 export {
 	getAgentDir,
 	getConfigDirName,

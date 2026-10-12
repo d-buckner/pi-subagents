@@ -7,15 +7,17 @@ import {
 	acquireAgentCapacitySlot,
 	AgentCapacityUnavailableError,
 	createAgentActivityLease,
-	driveAgentActivityLease,
 	formatAgentCapacity,
 	readAgentCapacityOccupants,
 	readAgentCapacitySnapshot,
+} from "../../src/shared/agent-capacity.ts";
+import {
+	resetAgentCapacityCache,
+	resolveAgentCapacity,
 	resolveAgentCapacityQueueTimeoutMs,
 	resolveAgentModelIdleAfterMs,
 	resolveMaxActiveAgents,
-} from "../../src/shared/agent-capacity.ts";
-import { resetAgentCapacityCache, resolveAgentCapacity } from "../../src/shared/agent-capacity-settings.ts";
+} from "../../src/shared/agent-capacity-settings.ts";
 
 function capacityRoot(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "agent-capacity-"));
@@ -48,6 +50,22 @@ function foreignLease(rootDir: string, key: string, overrides: Record<string, un
 
 function lease(rootDir: string, overrides: Parameters<typeof createAgentActivityLease>[0] = {}) {
 	return createAgentActivityLease({ kind: "parent", label: "test", rootDir, heartbeatMs: 5, ...overrides });
+}
+
+function started(rootDir: string, overrides: Parameters<typeof createAgentActivityLease>[0] = {}) {
+	const slot = lease(rootDir, overrides);
+	slot.drive({ type: "agent_start" });
+	return slot;
+}
+
+/** What the pool sees, which is the only thing a caller may depend on. */
+function counts(rootDir: string, limit: number | null = 3) {
+	const snapshot = readAgentCapacitySnapshot(limit, { rootDir });
+	return { used: snapshot.used, waiting: snapshot.waiting, visible: snapshot.occupants.length };
+}
+
+function settings(overrides: Partial<ReturnType<typeof resolveAgentCapacity>> = {}) {
+	return { limit: 1, idleAfterMs: 30_000, queueTimeoutMs: 5_000, ...overrides };
 }
 
 describe("resolveAgentCapacity", () => {
@@ -110,14 +128,11 @@ describe("capacity tuning resolution", () => {
 describe("agent activity leases", () => {
 	it("claims capacity while the agent works the model", () => {
 		const rootDir = capacityRoot();
-		const slot = lease(rootDir);
+		const slot = started(rootDir);
 		try {
-			slot.markRunning();
-			assert.equal(slot.isHolding(), true);
-			const snapshot = readAgentCapacitySnapshot(3, rootDir);
-			assert.equal(snapshot.used, 1);
-			assert.equal(snapshot.remaining, 2);
-			assert.equal(snapshot.occupants[0]?.kind, "parent");
+			assert.deepEqual(counts(rootDir), { used: 1, waiting: 0, visible: 1 });
+			assert.equal(readAgentCapacitySnapshot(3, { rootDir }).remaining, 2);
+			assert.equal(readAgentCapacitySnapshot(3, { rootDir }).occupants[0]?.kind, "parent");
 		} finally {
 			slot.release();
 		}
@@ -128,11 +143,10 @@ describe("agent activity leases", () => {
 		const rootDir = capacityRoot();
 		foreignLease(rootDir, "full-1");
 		foreignLease(rootDir, "full-2");
-		const slot = lease(rootDir, { limit: 2 });
+		const slot = started(rootDir, { limit: 2 });
 		try {
-			slot.markRunning();
-			assert.equal(slot.isHolding(), false);
-			assert.equal(readAgentCapacitySnapshot(2, rootDir).used, 2);
+			// Visible but uncounted: the agent runs, it just has no slot.
+			assert.deepEqual(counts(rootDir, 2), { used: 2, waiting: 1, visible: 3 });
 		} finally {
 			slot.release();
 		}
@@ -140,15 +154,12 @@ describe("agent activity leases", () => {
 
 	it("releases capacity once a tool call outlives the model-idle grace", async () => {
 		const rootDir = capacityRoot();
-		const slot = lease(rootDir, { idleAfterMs: 20 });
+		const slot = started(rootDir, { idleAfterMs: 20 });
 		try {
-			slot.markRunning();
-			slot.toolStarted("build");
-			assert.equal(slot.isHolding(), true, "a short tool call keeps the slot");
+			slot.drive({ type: "tool_execution_start", toolCallId: "build" });
+			assert.equal(counts(rootDir).used, 1, "a short tool call keeps the slot");
 			await sleep(80);
-			assert.equal(slot.isHolding(), false, "a long tool call releases the slot");
-			assert.equal(readAgentCapacitySnapshot(3, rootDir).used, 0);
-			assert.equal(readAgentCapacitySnapshot(3, rootDir).waiting, 1, "the waiting agent stays visible");
+			assert.deepEqual(counts(rootDir), { used: 0, waiting: 1, visible: 1 }, "a long tool call releases the slot");
 		} finally {
 			slot.release();
 		}
@@ -156,14 +167,13 @@ describe("agent activity leases", () => {
 
 	it("reclaims capacity when the agent returns to model work", async () => {
 		const rootDir = capacityRoot();
-		const slot = lease(rootDir, { idleAfterMs: 20 });
+		const slot = started(rootDir, { idleAfterMs: 20 });
 		try {
-			slot.markRunning();
-			slot.toolStarted("build");
+			slot.drive({ type: "tool_execution_start", toolCallId: "build" });
 			await sleep(80);
-			assert.equal(slot.isHolding(), false);
-			slot.toolEnded("build");
-			assert.equal(slot.isHolding(), true);
+			assert.equal(counts(rootDir).used, 0);
+			slot.drive({ type: "tool_execution_end", toolCallId: "build" });
+			assert.equal(counts(rootDir).used, 1);
 		} finally {
 			slot.release();
 		}
@@ -171,15 +181,14 @@ describe("agent activity leases", () => {
 
 	it("lets a resuming agent run uncounted when the pool filled while it waited", async () => {
 		const rootDir = capacityRoot();
-		const slot = lease(rootDir, { idleAfterMs: 20, limit: 1 });
+		const slot = started(rootDir, { idleAfterMs: 20, limit: 1 });
 		try {
-			slot.markRunning();
-			slot.toolStarted("build");
+			slot.drive({ type: "tool_execution_start", toolCallId: "build" });
 			await sleep(80);
-			assert.equal(slot.isHolding(), false);
 			foreignLease(rootDir, "took-the-slot");
-			slot.toolEnded("build");
-			assert.equal(slot.isHolding(), false, "reclaim waits for room instead of overshooting");
+			slot.drive({ type: "tool_execution_end", toolCallId: "build" });
+			// Reclaim waits for room instead of overshooting the cap.
+			assert.deepEqual(counts(rootDir, 1), { used: 1, waiting: 1, visible: 2 });
 		} finally {
 			slot.release();
 		}
@@ -187,12 +196,18 @@ describe("agent activity leases", () => {
 
 	it("drops the lease when the turn ends", () => {
 		const rootDir = capacityRoot();
-		const slot = lease(rootDir);
-		slot.markRunning();
-		slot.markIdle();
-		assert.equal(slot.isHolding(), false);
+		const slot = started(rootDir);
+		slot.drive({ type: "agent_settled" });
 		assert.equal(readAgentCapacityOccupants(rootDir).length, 0);
 		slot.release();
+	});
+
+	it("records nothing once released", () => {
+		const rootDir = capacityRoot();
+		const slot = started(rootDir);
+		slot.release();
+		slot.drive({ type: "agent_start" });
+		assert.equal(readAgentCapacityOccupants(rootDir).length, 0, "release is terminal");
 	});
 });
 
@@ -227,15 +242,13 @@ describe("lease liveness", () => {
 describe("acquireAgentCapacitySlot", () => {
 	it("waits for a slot and takes it once capacity frees", async () => {
 		const rootDir = capacityRoot();
-		const blocker = lease(rootDir);
-		blocker.markRunning();
+		const blocker = started(rootDir);
 		let waited = 0;
 		const pending = acquireAgentCapacitySlot({
-			limit: 1,
 			label: "worker",
 			rootDir,
 			pollMs: 10,
-			queueTimeoutMs: 5_000,
+			settings: settings(),
 			onWait: () => { waited++; },
 		});
 		await sleep(40);
@@ -243,8 +256,7 @@ describe("acquireAgentCapacitySlot", () => {
 		blocker.release();
 		const slot = await pending;
 		try {
-			assert.equal(slot.isHolding(), true);
-			assert.equal(readAgentCapacitySnapshot(1, rootDir).used, 1);
+			assert.deepEqual(counts(rootDir, 1), { used: 1, waiting: 0, visible: 1 });
 		} finally {
 			slot.release();
 		}
@@ -252,11 +264,10 @@ describe("acquireAgentCapacitySlot", () => {
 
 	it("fails the launch once the queue deadline passes", async () => {
 		const rootDir = capacityRoot();
-		const blocker = lease(rootDir);
-		blocker.markRunning();
+		const blocker = started(rootDir);
 		try {
 			await assert.rejects(
-				acquireAgentCapacitySlot({ limit: 1, label: "worker", rootDir, pollMs: 10, queueTimeoutMs: 40 }),
+				acquireAgentCapacitySlot({ label: "worker", rootDir, pollMs: 10, settings: settings({ queueTimeoutMs: 40 }) }),
 				(error) => error instanceof AgentCapacityUnavailableError && /Agent capacity is full/.test(error.message),
 			);
 		} finally {
@@ -266,10 +277,9 @@ describe("acquireAgentCapacitySlot", () => {
 
 	it("rejects a waiter whose launch was cancelled", async () => {
 		const rootDir = capacityRoot();
-		const blocker = lease(rootDir);
-		blocker.markRunning();
+		const blocker = started(rootDir);
 		const controller = new AbortController();
-		const pending = acquireAgentCapacitySlot({ limit: 1, label: "worker", rootDir, pollMs: 10, signal: controller.signal });
+		const pending = acquireAgentCapacitySlot({ label: "worker", rootDir, pollMs: 10, settings: settings(), signal: controller.signal });
 		await sleep(20);
 		controller.abort();
 		await assert.rejects(pending, /cancelled while it waited/);
@@ -279,39 +289,50 @@ describe("acquireAgentCapacitySlot", () => {
 	it("never lets two launches share the last slot", async () => {
 		const rootDir = capacityRoot();
 		const results = await Promise.allSettled([
-			acquireAgentCapacitySlot({ limit: 1, label: "a", rootDir, pollMs: 5, queueTimeoutMs: 300 }),
-			acquireAgentCapacitySlot({ limit: 1, label: "b", rootDir, pollMs: 5, queueTimeoutMs: 300 }),
+			acquireAgentCapacitySlot({ label: "a", rootDir, pollMs: 5, settings: settings({ queueTimeoutMs: 300 }) }),
+			acquireAgentCapacitySlot({ label: "b", rootDir, pollMs: 5, settings: settings({ queueTimeoutMs: 300 }) }),
 		]);
 		const won = results.filter((result) => result.status === "fulfilled");
 		assert.equal(won.length, 1, "exactly one launch may take the last slot");
 		for (const result of won) (result as PromiseFulfilledResult<Awaited<ReturnType<typeof acquireAgentCapacitySlot>>>).value.release();
 	});
+
+	it("writes nothing and never waits when no cap is configured", async () => {
+		const rootDir = capacityRoot();
+		const blocker = started(rootDir, { limit: 1 });
+		try {
+			const slot = await acquireAgentCapacitySlot({ label: "worker", rootDir, settings: settings({ limit: null }) });
+			slot.drive({ type: "agent_start" });
+			slot.release();
+			assert.equal(counts(rootDir, 1).used, 1, "only the blocker is counted");
+		} finally {
+			blocker.release();
+		}
+	});
 });
 
-describe("driveAgentActivityLease", () => {
-	it("follows the agent and tool events of a child stream", () => {
+describe("fail-open behaviour", { skip: typeof process.getuid === "function" && process.getuid() === 0 }, () => {
+	it("treats an unreadable pool as unlimited instead of full", async () => {
 		const rootDir = capacityRoot();
-		const slot = lease(rootDir, { idleAfterMs: 60_000 });
+		fs.mkdirSync(rootDir, { recursive: true });
+		fs.chmodSync(rootDir, 0o000);
 		try {
-			driveAgentActivityLease(slot, { type: "agent_start" });
-			assert.equal(slot.isHolding(), true);
-			driveAgentActivityLease(slot, { type: "tool_execution_start", toolCallId: "t1" });
-			assert.equal(slot.isHolding(), true);
-			driveAgentActivityLease(slot, { type: "tool_execution_end", toolCallId: "t1" });
-			driveAgentActivityLease(slot, { type: "agent_settled" });
-			assert.equal(slot.isHolding(), false);
-			driveAgentActivityLease(slot, { type: "message_update" });
-			driveAgentActivityLease(slot, { type: "agent_start" });
-			assert.equal(slot.isHolding(), true);
-		} finally {
+			const snapshot = readAgentCapacitySnapshot(1, { rootDir });
+			assert.equal(snapshot.unreadable, true);
+			assert.match(formatAgentCapacity(snapshot), /unavailable/);
+			// A launch must not be stalled or failed by a pool it cannot read.
+			const slot = await acquireAgentCapacitySlot({ label: "worker", rootDir, pollMs: 5, settings: settings({ queueTimeoutMs: 200 }) });
 			slot.release();
+		} finally {
+			fs.chmodSync(rootDir, 0o700);
+			fs.rmSync(rootDir, { recursive: true, force: true });
 		}
 	});
 });
 
 describe("formatAgentCapacity", () => {
 	it("states the cap when one is configured and says unlimited when it is not", () => {
-		assert.match(formatAgentCapacity(readAgentCapacitySnapshot(3, capacityRoot())), /3 in use, 3 free/);
-		assert.match(formatAgentCapacity(readAgentCapacitySnapshot(undefined, capacityRoot())), /unlimited/);
+		assert.match(formatAgentCapacity(readAgentCapacitySnapshot(3, { rootDir: capacityRoot() })), /3 in use, 3 free/);
+		assert.match(formatAgentCapacity(readAgentCapacitySnapshot(undefined, { rootDir: capacityRoot() })), /unlimited/);
 	});
 });

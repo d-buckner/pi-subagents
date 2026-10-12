@@ -54,8 +54,9 @@ import { renderSubagentEntry, renderSubagentMessage, SUBAGENT_ENTRY_TYPES, SUBAG
 import { registerHerdrStatusBridge, type HerdrStatusRun } from "../integrations/herdr-status.ts";
 import { registerProgramStatusReporter } from "../integrations/program-status.ts";
 import {
-	createAgentActivityLease,
+	createParentActivityLease,
 	type AgentActivityLease,
+	type AgentCapacityEvent,
 } from "../shared/agent-capacity.ts";
 import { resolveAgentCapacity } from "../shared/agent-capacity-settings.ts";
 import { hasLiveSubagentWork, registerPiWebSessionLiveness } from "../integrations/pi-web-session-liveness.ts";
@@ -477,33 +478,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	// Machine-wide agent capacity. This parent session is never gated by it —
 	// opening a pi session is the operator's own act — but it occupies a slot
 	// while it works the model, so children can see the room it takes.
-	const agentCapacity = resolveAgentCapacity();
 	let parentActivityLease: AgentActivityLease | undefined;
 	const parentActivity = {
 		start(sessionId: string | null) {
 			parentActivityLease?.release();
-			parentActivityLease = undefined;
-			// Without a configured cap there is nothing to count, so nothing is written.
-			if (agentCapacity.limit === null) return;
-			parentActivityLease = createAgentActivityLease({
-				kind: "parent",
-				label: "pi session",
-				limit: null,
-				idleAfterMs: agentCapacity.idleAfterMs,
-				...(sessionId ? { sessionId } : {}),
-			});
+			parentActivityLease = createParentActivityLease({ label: "pi session", ...(sessionId ? { sessionId } : {}) });
 		},
-		markRunning() {
-			parentActivityLease?.markRunning();
-		},
-		markIdle() {
-			parentActivityLease?.markIdle();
-		},
-		toolStarted(toolCallId: string) {
-			parentActivityLease?.toolStarted(toolCallId);
-		},
-		toolEnded(toolCallId: string) {
-			parentActivityLease?.toolEnded(toolCallId);
+		drive(event: AgentCapacityEvent) {
+			parentActivityLease?.drive(event);
 		},
 		dispose() {
 			parentActivityLease?.release();
@@ -1100,7 +1082,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	pi.on("agent_start", () => {
 		cancelCompactionResume();
 		parentWake.agentStarted();
-		parentActivity.markRunning();
+		parentActivity.drive({ type: "agent_start" });
 		resumeWidgetsAfterCompaction();
 		herdrStatusBridge.agentStarted();
 		programStatus.agentStarted();
@@ -1111,14 +1093,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	pi.on("agent_settled", () => {
 		// Settled means no retry, compaction, or queued continuation is left, so the
 		// session is off the model and gives its slot back.
-		parentActivity.markIdle();
+		parentActivity.drive({ type: "agent_settled" });
 		resumeWidgetsAfterCompaction();
 		programStatus.agentSettled();
 	});
 
-	pi.on("tool_execution_start", (event) => parentActivity.toolStarted(event.toolCallId));
+	pi.on("tool_execution_start", (event) => parentActivity.drive({ type: "tool_execution_start", toolCallId: event.toolCallId }));
 
-	pi.on("tool_execution_end", (event) => parentActivity.toolEnded(event.toolCallId));
+	pi.on("tool_execution_end", (event) => parentActivity.drive({ type: "tool_execution_end", toolCallId: event.toolCallId }));
 
 	pi.on("session_before_compact", (event) => {
 		if (event.reason !== "manual") suspendWidgetsForCompaction();

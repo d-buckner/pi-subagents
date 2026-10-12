@@ -670,11 +670,11 @@ function withSpawnBudgetStatus(
 		: { used: 0, limit: resolveMaxActiveAsyncRunsPerSession(config.maxActiveAsyncRunsPerSession) ?? 0 };
 	state.activeAsyncCapacity = activeAsyncCapacity;
 	const agentCapacity = readAgentCapacitySnapshot(resolveAgentCapacity().limit);
-	// An uncapped pool has nothing worth reporting, so it stays out of the way.
 	const capacityLines = [
 		formatSpawnBudget(spawnBudget),
 		`Active async capacity: ${activeAsyncCapacity.used}/${activeAsyncCapacity.limit || "unlimited"} used`,
-		...(agentCapacity.limit === null ? [] : [formatAgentCapacity(agentCapacity)]),
+		// An uncapped pool has nothing worth reporting, so it stays out of the way.
+		...(agentCapacity.limit === null && !agentCapacity.unreadable ? [] : [formatAgentCapacity(agentCapacity)]),
 	].join("\n");
 	return {
 		...result,

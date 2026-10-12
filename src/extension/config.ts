@@ -13,7 +13,7 @@ import {
 	MAX_AGENT_MODEL_IDLE_AFTER_MS,
 	MIN_AGENT_CAPACITY_QUEUE_TIMEOUT_MS,
 	MIN_AGENT_MODEL_IDLE_AFTER_MS,
-} from "../shared/agent-capacity.ts";
+} from "../shared/agent-capacity-settings.ts";
 import { normalizeWorktreeBranchPrefix } from "../runs/shared/worktree.ts";
 import { validateModelResponseAliases } from "../shared/model-response-aliases.ts";
 import { validateDisabledFeatures } from "../shared/disabled-features.ts";

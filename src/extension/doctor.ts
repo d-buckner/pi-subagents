@@ -203,9 +203,10 @@ function formatAgentCapacitySection(input: DoctorReportInput): string[] {
 	if (!snapshot) return ["- capacity: not measured by this runtime"];
 	return [
 		`- usage: ${snapshot.used}/${snapshot.limit ?? "unlimited"} model-active agents, ${snapshot.remaining ?? "unlimited"} free`,
-		`- waiting: ${snapshot.waiting} agent(s) inside a turn but blocked on a tool call or a reply, so they hold no slot`,
+		`- waiting: ${snapshot.waiting} agent(s) inside a turn but blocked on a long tool call, so they hold no slot`,
 		"- scope: every pi process of this user, parent sessions included; parent sessions are never blocked by the cap",
 		"- release: a turn settling, or a tool call outliving the model-idle grace; a dead process ages out without cleanup",
+		"- failure policy: an unreadable pool leaves launches ungated rather than blocked",
 	];
 }
 

@@ -9,10 +9,9 @@ import { discoverAgents, formatUnknownAgentError, unknownAgentDiagnosticContext,
 import { alignForkedSessionCwd } from "../../shared/fork-session-cwd.ts";
 import {
 	acquireAgentCapacitySlot,
-	driveAgentActivityLease,
 	type AgentActivityLease,
+	type AgentCapacityEvent,
 } from "../../shared/agent-capacity.ts";
-import { resolveAgentCapacity } from "../../shared/agent-capacity-settings.ts";
 import { buildEffectiveSystemPrompt } from "../shared/effective-system-prompt.ts";
 import {
 	ensureArtifactsDir,
@@ -987,7 +986,7 @@ async function runSingleAttempt(
 
 		const processEvent = (evt: ChildSessionEvent & { message?: Message; toolName?: string; toolCallId?: string; args?: unknown; willRetry?: unknown }) => {
 			if (lifecycleFinished) return;
-			if (activityLease) driveAgentActivityLease(activityLease, evt as { type?: string; toolCallId?: string });
+			if (activityLease) activityLease.drive(evt as AgentCapacityEvent);
 			partialOutput.observe(evt);
 			jsonlWriter.writeLine(JSON.stringify(projectChildSessionEventForJson(evt)));
 			shared.transcriptWriter?.writeChildEvent(evt);
@@ -1427,20 +1426,15 @@ async function runSingleAttempt(
 		void (async () => {
 			try {
 				const input = createReportedChildSessionInput(launch, shared.transcriptWriter);
-				const capacity = resolveAgentCapacity();
-				if (capacity.limit !== null) {
-					// Wait for room in the machine-wide pool before the child exists, so a
-					// queued launch never shows up as a running agent.
-					activityLease = await acquireAgentCapacitySlot({
-						limit: capacity.limit,
-						label: agent.name,
-						idleAfterMs: capacity.idleAfterMs,
-						queueTimeoutMs: capacity.queueTimeoutMs,
-						...(options.runId ? { runId: options.runId } : {}),
-						...(options.parentSessionId ? { sessionId: options.parentSessionId } : {}),
-						signal: options.signal,
-					});
-				}
+				// Wait for room in the machine-wide pool before the child exists, so a
+				// queued launch never shows up as a running agent. With no cap configured
+				// this returns an inert lease without touching the filesystem.
+				activityLease = await acquireAgentCapacitySlot({
+					label: agent.name,
+					...(options.runId ? { runId: options.runId } : {}),
+					...(options.parentSessionId ? { sessionId: options.parentSessionId } : {}),
+					signal: options.signal,
+				});
 				if (lifecycleFinished) {
 					// The run ended while this launch waited; give the slot straight back.
 					activityLease?.release();

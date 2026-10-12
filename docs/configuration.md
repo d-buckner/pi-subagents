@@ -499,6 +499,8 @@ A slot is held while an agent is on the model, not while it is merely alive. An 
 
 Reclaim after a long tool call is opportunistic: an agent that finds the pool full when its tool finally returns still finishes its turn, because admission already happened and stopping live model work is not something the pool can honestly undo. The cap bounds admission, and it is exact at launch.
 
+Nothing about the pool may cost you a launch. If the pool directory cannot be read, launches proceed ungated and `doctor` reports the capacity as unavailable rather than full.
+
 ```json
 { "capacity": { "maxActiveAgents": 3, "modelIdleAfterMs": 30000, "queueTimeoutMs": 1800000 } }
 ```
@@ -506,7 +508,7 @@ Reclaim after a long tool call is opportunistic: an agent that finds the pool fu
 - `modelIdleAfterMs` — how long a tool call may run before its agent releases its slot. Defaults to `30000`; valid range 5000 through 600000.
 - `queueTimeoutMs` — how long a child waits for a slot before its launch fails with `Agent capacity is full`. Defaults to `1800000` (30 minutes); valid range 1000 through 86400000.
 
-Every process reads these three values from this same config file, so a change applies to new pi sessions and new runners rather than to ones already running. `subagent({ action: "status" })` and `subagent({ action: "doctor" })` report used, limit, free, and waiting counts.
+Every process reads these three values from this same config file, so a change applies to new pi sessions and new runners rather than to ones already running. `subagent({ action: "status" })` and `subagent({ action: "doctor" })` report used, limit, free, and waiting counts, where waiting means a live agent that released its slot because a tool call ran long.
 
 This limit is separate from `globalConcurrencyLimit` (children inside one run), `maxActiveAsyncRunsPerSession` (top-level async runs per session), and the cumulative `maxSubagentSpawnsPerSession` / `maxSubagentSpawnsPerRun` budgets.
 
