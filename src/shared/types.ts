@@ -18,6 +18,7 @@ import type { ExtensionBindings } from "../runs/shared/extension-bindings.ts";
 import type { WorkflowChildPermitContext } from "./workflow-child-permit.ts";
 import type { WatchdogWarningDetails } from "../watchdog/types.ts";
 import type { RequiredChildExtensionSnapshot } from "./required-child-extensions.ts";
+import type { AgentCapacitySnapshot } from "./agent-capacity.ts";
 
 // ============================================================================
 // Basic Types
@@ -1509,6 +1510,7 @@ export interface Details {
 	runFanoutBudget?: RunFanoutBudgetSnapshot;
 	runFanoutRejection?: RunFanoutRejection;
 	activeAsyncCapacity?: ActiveAsyncCapacitySnapshot;
+	agentCapacity?: AgentCapacitySnapshot;
 	agentCapabilities?: AgentCapabilitiesSnapshot;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	capabilityAudit?: SubagentCapabilityAudit;
