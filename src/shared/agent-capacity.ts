@@ -123,6 +123,13 @@ function parseOccupant(value: unknown): AgentCapacityOccupant | undefined {
 	return occupant as AgentCapacityOccupant;
 }
 
+/** Delete a lease no current runtime can parse, but only once it has aged out. */
+function reapUnparseableLease(filePath: string, now: number): void {
+	try {
+		if (now - fs.statSync(filePath).mtimeMs > LEASE_GC_AFTER_MS) fs.rmSync(filePath, { force: true });
+	} catch {}
+}
+
 function leasePath(rootDir: string, key: string): string {
 	return path.join(rootDir, `${key}.json`);
 }
@@ -160,12 +167,13 @@ export function readAgentCapacityOccupants(rootDir = AGENT_CAPACITY_DIR, now = D
 		try {
 			occupant = parseOccupant(JSON.parse(fs.readFileSync(filePath, "utf-8")));
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-				// Unreadable litter from an older runtime still has to age out.
-				try {
-					if (now - fs.statSync(filePath).mtimeMs > LEASE_GC_AFTER_MS) fs.rmSync(filePath, { force: true });
-				} catch {}
-			}
+			// Unreadable litter from an older runtime still has to age out.
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") reapUnparseableLease(filePath, now);
+			continue;
+		}
+		if (!occupant) {
+			// Well-formed JSON from an incompatible runtime: unusable here, so it ages out too.
+			reapUnparseableLease(filePath, now);
 			continue;
 		}
 		const age = now - occupant.lastSeenAt;
