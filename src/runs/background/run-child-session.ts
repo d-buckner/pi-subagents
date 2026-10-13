@@ -31,6 +31,11 @@ import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
 import { formatSteerMessage } from "../shared/subagent-prompt-runtime.ts";
 import type { SteerDeliveryStatus, SteerRequest } from "./control-channel.ts";
 import { takeMatchingAcceptedSteer, unconsumedSteerReason } from "./steering.ts";
+import {
+	acquireAgentCapacitySlot,
+	type AgentActivityLease,
+	type AgentCapacityEvent,
+} from "../../shared/agent-capacity.ts";
 
 export interface ChildEventContext {
 	runId: string;
@@ -192,6 +197,8 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		let messageBaseline: number | undefined;
 		const acceptedSteers: Array<{ request: SteerRequest; text: string }> = [];
 		let unsubscribe: (() => void) | undefined;
+		// Machine-wide capacity held for this child while it works the model.
+		let activityLease: AgentActivityLease | undefined;
 		let settled = false;
 		let promptSettled = false;
 		let forcedTermination = false;
@@ -416,6 +423,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 
 		const processEvent = (raw: ChildSessionEvent): void => {
 			if (settled) return;
+			if (activityLease) activityLease.drive(raw as AgentCapacityEvent);
 			partialOutput.observe(raw);
 			const event = raw as ChildSessionEvent & ChildEvent;
 			appendChildEvent(projectChildSessionEventForJson(raw) as Record<string, unknown>);
@@ -565,6 +573,8 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			input.registerSteer?.(undefined);
 			input.registerWatchdogStatus?.(undefined);
 			unsubscribe?.();
+			activityLease?.release();
+			activityLease = undefined;
 			let commandError: string | undefined;
 			if (!interrupted && !timedOut && !stopped) {
 				try { await session?.finishCommands?.(); }
@@ -672,6 +682,19 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		void (async () => {
 			try {
 				const createInput = createReportedChildSessionInput(input.launch, input.transcriptWriter);
+				// Wait for room in the machine-wide pool before the child exists, so a
+				// queued launch never shows up as a running agent. With no cap configured
+				// this returns an inert lease without touching the filesystem.
+				activityLease = await acquireAgentCapacitySlot({
+					label: input.childEventContext?.agent ?? "subagent",
+					...(input.childEventContext ? { runId: input.childEventContext.runId } : {}),
+				});
+				if (settled) {
+					// The run ended while this launch waited; give the slot straight back.
+					activityLease?.release();
+					activityLease = undefined;
+					return;
+				}
 				const created = await input.factory.create(createInput);
 				if (settled) {
 					await created.dispose().catch(() => undefined);

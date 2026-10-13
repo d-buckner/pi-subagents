@@ -2678,6 +2678,16 @@ export interface ForkContextConfig {
 export interface ActiveAsyncCapacityConfig {
 	/** Reclaim failed runner slots after this age when process proof is unknown; false keeps strict retention. */
 	abandonedSlotReleaseAfterMs?: number | false;
+	/**
+	 * Machine-wide cap on agents doing model work at once: every live parent Pi
+	 * session plus every running child. A child launch waits for room; parent
+	 * sessions are never blocked. Unset or 0 means unlimited.
+	 */
+	maxActiveAgents?: number;
+	/** How long a tool call may run before its agent releases its slot. Defaults to 30000. */
+	modelIdleAfterMs?: number;
+	/** How long a child waits for a slot before its launch fails. Defaults to 1800000. */
+	queueTimeoutMs?: number;
 }
 
 export interface ExtensionConfig {
@@ -2731,7 +2741,7 @@ export interface ExtensionConfig {
 	maxSubagentSpawnsPerRun?: number;
 	/** Optional active top-level async run cap per parent session. Unset or 0 means unlimited. */
 	maxActiveAsyncRunsPerSession?: number;
-	/** Active-capacity cleanup policy. */
+	/** Active-capacity limits and cleanup policy. */
 	capacity?: ActiveAsyncCapacityConfig;
 	/** Global cap on simultaneously-running subagent tasks within a single run. Defaults to 20. */
 	globalConcurrencyLimit?: number;

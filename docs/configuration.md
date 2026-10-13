@@ -483,6 +483,35 @@ This limit bounds current top-level async load. It is separate from cumulative `
 
 `subagent({ action: "status" })`, fleet status, and `subagent({ action: "doctor" })` expose used, effective limit, and remaining active capacity. Static chains and parallel calls fail before creating run artifacts or starting partial work when their declared capacity cannot fit. Later retries or unbounded dynamic work are not guaranteed by that preflight.
 
+## `capacity.maxActiveAgents`
+
+```json
+{ "capacity": { "maxActiveAgents": 3 } }
+```
+
+Optionally caps how many agents are doing model work at the same time across every pi process this user runs — every live parent session plus every running child. Unset or `0` leaves the pool unlimited, which is the default and costs nothing: with no cap configured no lease is written and no launch waits.
+
+The pool is one shared directory under the pi-subagents temp root, so it spans projects and terminals. A cap of `3` with one working parent session leaves room for two subagents; with three working parent sessions there is no room left and a subagent launch waits.
+
+**Parent sessions are never blocked.** Opening a pi session is your own act, not delegated work, so a parent session takes a slot when one is free and runs anyway when none is. Only subagent launches wait.
+
+A slot is held while an agent is on the model, not while it is merely alive. An agent blocked on a long tool call — a build, a test suite, a supervisor reply — releases its slot once the tool outlives `capacity.modelIdleAfterMs` and reclaims it when the tool returns. A session sitting at the prompt holds nothing, and a process that dies stops refreshing and stops being counted within about 15 seconds, so no crash can wedge the pool.
+
+Reclaim after a long tool call is opportunistic: an agent that finds the pool full when its tool finally returns still finishes its turn, because admission already happened and stopping live model work is not something the pool can honestly undo. The cap bounds admission, and it is exact at launch.
+
+Nothing about the pool may cost you a launch. If the pool directory cannot be read, launches proceed ungated and `doctor` reports the capacity as unavailable rather than full.
+
+```json
+{ "capacity": { "maxActiveAgents": 3, "modelIdleAfterMs": 30000, "queueTimeoutMs": 1800000 } }
+```
+
+- `modelIdleAfterMs` — how long a tool call may run before its agent releases its slot. Defaults to `30000`; valid range 5000 through 600000.
+- `queueTimeoutMs` — how long a child waits for a slot before its launch fails with `Agent capacity is full`. Defaults to `1800000` (30 minutes); valid range 1000 through 86400000.
+
+Every process reads these three values from this same config file, so a change applies to new pi sessions and new runners rather than to ones already running. `subagent({ action: "status" })` and `subagent({ action: "doctor" })` report used, limit, free, and waiting counts, where waiting means a live agent that released its slot because a tool call ran long.
+
+This limit is separate from `globalConcurrencyLimit` (children inside one run), `maxActiveAsyncRunsPerSession` (top-level async runs per session), and the cumulative `maxSubagentSpawnsPerSession` / `maxSubagentSpawnsPerRun` budgets.
+
 ## `scheduledRuns`
 
 ```json

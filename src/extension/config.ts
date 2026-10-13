@@ -8,6 +8,12 @@ import { validateAuthorityPolicy } from "../policy/authority.ts";
 import { getAgentDir } from "../shared/utils.ts";
 import { validatePermissionConfig } from "../runs/shared/permissions.ts";
 import { MAX_ABANDONED_SLOT_RELEASE_AFTER_MS, MIN_ABANDONED_SLOT_RELEASE_AFTER_MS } from "../runs/background/active-async-capacity.ts";
+import {
+	MAX_AGENT_CAPACITY_QUEUE_TIMEOUT_MS,
+	MAX_AGENT_MODEL_IDLE_AFTER_MS,
+	MIN_AGENT_CAPACITY_QUEUE_TIMEOUT_MS,
+	MIN_AGENT_MODEL_IDLE_AFTER_MS,
+} from "../shared/agent-capacity-settings.ts";
 import { normalizeWorktreeBranchPrefix } from "../runs/shared/worktree.ts";
 import { validateModelResponseAliases } from "../shared/model-response-aliases.ts";
 import { validateDisabledFeatures } from "../shared/disabled-features.ts";
@@ -92,7 +98,8 @@ function validateArtifactConfig(value: unknown): void {
 function validateCapacityConfig(value: unknown): void {
 	if (value === undefined) return;
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.capacity must be a JSON object");
-	const abandonedSlotReleaseAfterMs = (value as Record<string, unknown>).abandonedSlotReleaseAfterMs;
+	const config = value as Record<string, unknown>;
+	const abandonedSlotReleaseAfterMs = config.abandonedSlotReleaseAfterMs;
 	if (abandonedSlotReleaseAfterMs !== undefined
 		&& abandonedSlotReleaseAfterMs !== false
 		&& (typeof abandonedSlotReleaseAfterMs !== "number"
@@ -100,6 +107,24 @@ function validateCapacityConfig(value: unknown): void {
 			|| abandonedSlotReleaseAfterMs < MIN_ABANDONED_SLOT_RELEASE_AFTER_MS
 			|| abandonedSlotReleaseAfterMs > MAX_ABANDONED_SLOT_RELEASE_AFTER_MS)) {
 		throw new Error(`config.capacity.abandonedSlotReleaseAfterMs must be false or an integer from ${MIN_ABANDONED_SLOT_RELEASE_AFTER_MS} to ${MAX_ABANDONED_SLOT_RELEASE_AFTER_MS}`);
+	}
+	if (config.maxActiveAgents !== undefined
+		&& (typeof config.maxActiveAgents !== "number" || !Number.isInteger(config.maxActiveAgents) || config.maxActiveAgents < 0)) {
+		throw new Error("config.capacity.maxActiveAgents must be a non-negative integer");
+	}
+	if (config.modelIdleAfterMs !== undefined
+		&& (typeof config.modelIdleAfterMs !== "number"
+			|| !Number.isInteger(config.modelIdleAfterMs)
+			|| config.modelIdleAfterMs < MIN_AGENT_MODEL_IDLE_AFTER_MS
+			|| config.modelIdleAfterMs > MAX_AGENT_MODEL_IDLE_AFTER_MS)) {
+		throw new Error(`config.capacity.modelIdleAfterMs must be an integer from ${MIN_AGENT_MODEL_IDLE_AFTER_MS} to ${MAX_AGENT_MODEL_IDLE_AFTER_MS}`);
+	}
+	if (config.queueTimeoutMs !== undefined
+		&& (typeof config.queueTimeoutMs !== "number"
+			|| !Number.isInteger(config.queueTimeoutMs)
+			|| config.queueTimeoutMs < MIN_AGENT_CAPACITY_QUEUE_TIMEOUT_MS
+			|| config.queueTimeoutMs > MAX_AGENT_CAPACITY_QUEUE_TIMEOUT_MS)) {
+		throw new Error(`config.capacity.queueTimeoutMs must be an integer from ${MIN_AGENT_CAPACITY_QUEUE_TIMEOUT_MS} to ${MAX_AGENT_CAPACITY_QUEUE_TIMEOUT_MS}`);
 	}
 }
 
